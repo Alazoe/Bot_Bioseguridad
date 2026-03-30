@@ -15,3 +15,4 @@ env/
 
 # Modelos descargados por sentence-transformers
 .cache/
+venv/
