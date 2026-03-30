@@ -1,6 +1,7 @@
 """
 rag.py - Módulo RAG: recupera contexto con BM25 y genera respuestas con Claude.
 """
+from __future__ import annotations
 
 import os
 import re

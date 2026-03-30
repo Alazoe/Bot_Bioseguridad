@@ -1,5 +1,7 @@
 """
-bot.py - Bot de Telegram para consultas de bioseguridad.
+from __future__ import annotations
+
+# bot.py - Bot de Telegram para consultas de bioseguridad.
 
 Uso:
     python bot.py
