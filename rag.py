@@ -1,20 +1,22 @@
 """
-rag.py - Módulo RAG: recupera contexto desde ChromaDB y genera respuestas con Claude.
+rag.py - Módulo RAG: recupera contexto con BM25 y genera respuestas con Claude.
 """
 
 import os
+import re
+import json
+import pickle
 from pathlib import Path
 
+import numpy as np
 import anthropic
-import chromadb
-from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
 load_dotenv()
 
 VECTOR_DB_DIR = Path("vector_db")
-COLLECTION_NAME = "bioseguridad"
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+CHUNKS_FILE = VECTOR_DB_DIR / "chunks.json"
+INDEX_FILE = VECTOR_DB_DIR / "bm25_index.pkl"
 TOP_K = 5
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1500
@@ -36,47 +38,54 @@ Formato de respuesta:
 """
 
 
-def _get_collection():
-    """Retorna la colección ChromaDB o None si no existe."""
-    if not VECTOR_DB_DIR.exists():
-        return None
-    try:
-        client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL
-        )
-        return client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
-    except Exception:
-        return None
+def tokenize(text: str) -> list[str]:
+    """Tokeniza texto en palabras (minúsculas), soporta español."""
+    return re.findall(r'\b\w+\b', text.lower())
+
+
+def _load_store() -> tuple:
+    """Carga el índice BM25 y los chunks desde disco. Retorna (bm25, chunks) o (None, [])."""
+    if not CHUNKS_FILE.exists() or not INDEX_FILE.exists():
+        return None, []
+    with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    with open(INDEX_FILE, "rb") as f:
+        bm25 = pickle.load(f)
+    return bm25, chunks
 
 
 def retrieve_context(query: str, top_k: int = TOP_K) -> tuple[str, list[str]]:
     """
-    Busca los fragmentos más relevantes para la consulta.
+    Busca los fragmentos más relevantes para la consulta usando BM25.
     Retorna (contexto_formateado, lista_de_fuentes).
     """
-    collection = _get_collection()
-    if collection is None or collection.count() == 0:
+    bm25, chunks = _load_store()
+    if bm25 is None or not chunks:
         return "", []
 
-    n = min(top_k, collection.count())
-    results = collection.query(query_texts=[query], n_results=n)
+    query_tokens = tokenize(query)
+    scores = bm25.get_scores(query_tokens)
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
+    top_indices = np.argsort(scores)[-top_k:][::-1]
+    top_indices = [int(i) for i in top_indices if scores[i] > 0]
+
+    if not top_indices:
+        return "", []
 
     context_parts = []
-    for doc, meta in zip(docs, metas):
-        context_parts.append(f"[{meta['source']}]\n{doc}")
+    sources: list[str] = []
+    for i in top_indices:
+        chunk = chunks[i]
+        context_parts.append(f"[{chunk['source']}]\n{chunk['text']}")
+        if chunk["source"] not in sources:
+            sources.append(chunk["source"])
 
-    sources = list(dict.fromkeys(m["source"] for m in metas))  # orden preservado, únicos
-    context = "\n\n---\n\n".join(context_parts)
-    return context, sources
+    return "\n\n---\n\n".join(context_parts), sources
 
 
 def answer_question(question: str, history: list[dict] | None = None) -> str:
     """
-    Genera una respuesta usando RAG + Claude.
+    Genera una respuesta usando RAG (BM25) + Claude.
 
     Args:
         question: Pregunta del usuario.
@@ -99,18 +108,16 @@ def answer_question(question: str, history: list[dict] | None = None) -> str:
         )
     else:
         user_content = (
-            f"Nota: No hay documentos indexados en la base de conocimiento. "
+            f"Nota: No hay documentos indexados o no se encontraron fragmentos relevantes. "
             f"Responde con conocimiento general sobre bioseguridad, indicando que no hay "
             f"documentos cargados en el sistema.\n\n"
             f"Pregunta: {question}"
         )
 
-    messages = []
+    messages: list[dict] = []
     if history:
-        # Incluir últimas 6 entradas del historial (3 intercambios)
         for msg in history[-6:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
-
     messages.append({"role": "user", "content": user_content})
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -120,19 +127,16 @@ def answer_question(question: str, history: list[dict] | None = None) -> str:
         system=SYSTEM_PROMPT,
         messages=messages,
     )
-
     return response.content[0].text
 
 
 def get_kb_stats() -> dict:
-    """
-    Retorna estadísticas de la base de conocimiento.
-    {"count": int, "sources": list[str]}
-    """
-    collection = _get_collection()
-    if collection is None or collection.count() == 0:
+    """Retorna estadísticas de la base de conocimiento."""
+    if not CHUNKS_FILE.exists():
         return {"count": 0, "sources": []}
-
-    results = collection.get(include=["metadatas"])
-    sources = list(dict.fromkeys(m["source"] for m in results["metadatas"]))
-    return {"count": collection.count(), "sources": sources}
+    with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    if not chunks:
+        return {"count": 0, "sources": []}
+    sources = list(dict.fromkeys(c["source"] for c in chunks))
+    return {"count": len(chunks), "sources": sources}

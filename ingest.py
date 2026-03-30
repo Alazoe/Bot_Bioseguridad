@@ -9,39 +9,26 @@ Uso:
 """
 
 import sys
+import re
+import json
+import pickle
 from pathlib import Path
+
 import fitz  # PyMuPDF
-import chromadb
-from chromadb.utils import embedding_functions
+import numpy as np
+from rank_bm25 import BM25Okapi
 
 DOCUMENTS_DIR = Path("documents")
 VECTOR_DB_DIR = Path("vector_db")
-COLLECTION_NAME = "bioseguridad"
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+CHUNKS_FILE = VECTOR_DB_DIR / "chunks.json"
+INDEX_FILE = VECTOR_DB_DIR / "bm25_index.pkl"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
 
-def get_embedding_function():
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
-    )
-
-
-def get_collection(create: bool = True):
-    VECTOR_DB_DIR.mkdir(exist_ok=True)
-    client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-    ef = get_embedding_function()
-    if create:
-        return client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=ef,
-            metadata={"hnsw:space": "cosine"},
-        )
-    try:
-        return client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
-    except Exception:
-        return None
+def tokenize(text: str) -> list[str]:
+    """Tokeniza texto en palabras (minúsculas), soporta español."""
+    return re.findall(r'\b\w+\b', text.lower())
 
 
 def chunk_text(text: str) -> list[str]:
@@ -59,7 +46,7 @@ def chunk_text(text: str) -> list[str]:
 
 
 def extract_text_from_pdf(filepath: Path) -> str:
-    """Extrae texto de un PDF página por página."""
+    """Extrae texto de un PDF página por página con PyMuPDF."""
     doc = fitz.open(filepath)
     pages_text = []
     for i, page in enumerate(doc):
@@ -70,35 +57,24 @@ def extract_text_from_pdf(filepath: Path) -> str:
     return "\n\n".join(pages_text)
 
 
-def ingest_file(filepath: Path, collection) -> int:
-    """Indexa un único PDF. Retorna el número de fragmentos añadidos."""
-    print(f"  Procesando: {filepath.name} ...", end="", flush=True)
+def load_chunks() -> list[dict]:
+    """Carga fragmentos existentes desde disco."""
+    if CHUNKS_FILE.exists():
+        with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
 
-    text = extract_text_from_pdf(filepath)
-    if not text.strip():
-        print(" (sin texto extraíble, omitido)")
-        return 0
 
-    chunks = chunk_text(text)
-    ids = [f"{filepath.stem}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [
-        {"source": filepath.name, "chunk_index": i, "total_chunks": len(chunks)}
-        for i in range(len(chunks))
-    ]
+def save_and_rebuild_index(all_chunks: list[dict]):
+    """Guarda fragmentos y reconstruye el índice BM25."""
+    VECTOR_DB_DIR.mkdir(exist_ok=True)
+    with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
 
-    # Upsert en lotes para evitar errores de memoria
-    batch_size = 50
-    added = 0
-    for i in range(0, len(chunks), batch_size):
-        collection.upsert(
-            ids=ids[i : i + batch_size],
-            documents=chunks[i : i + batch_size],
-            metadatas=metadatas[i : i + batch_size],
-        )
-        added += len(chunks[i : i + batch_size])
-
-    print(f" {len(chunks)} fragmentos indexados.")
-    return len(chunks)
+    corpus = [tokenize(c["text"]) for c in all_chunks]
+    bm25 = BM25Okapi(corpus)
+    with open(INDEX_FILE, "wb") as f:
+        pickle.dump(bm25, f)
 
 
 def ingest_documents(documents_dir: Path = DOCUMENTS_DIR):
@@ -112,49 +88,73 @@ def ingest_documents(documents_dir: Path = DOCUMENTS_DIR):
         return
 
     print(f"Encontrados {len(pdf_files)} PDF(s) en '{documents_dir}/'")
-    print("Cargando modelo de embeddings (primera vez puede tardar)...\n")
 
-    collection = get_collection(create=True)
-    total_chunks = 0
+    existing_chunks = load_chunks()
+    existing_sources = {c["source"] for c in existing_chunks}
+    all_chunks = list(existing_chunks)
+    total_new = 0
 
     for pdf_path in pdf_files:
-        total_chunks += ingest_file(pdf_path, collection)
+        if pdf_path.name in existing_sources:
+            print(f"  Ya indexado: {pdf_path.name} (omitido)")
+            continue
+
+        print(f"  Procesando: {pdf_path.name} ...", end="", flush=True)
+        text = extract_text_from_pdf(pdf_path)
+
+        if not text.strip():
+            print(" (sin texto extraíble, omitido)")
+            continue
+
+        chunks = chunk_text(text)
+        for i, chunk in enumerate(chunks):
+            all_chunks.append({
+                "id": f"{pdf_path.stem}_chunk_{i}",
+                "text": chunk,
+                "source": pdf_path.name,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+            })
+        total_new += len(chunks)
+        print(f" {len(chunks)} fragmentos indexados.")
+
+    if total_new > 0:
+        print("\nReconstruyendo índice BM25...", end="", flush=True)
+        save_and_rebuild_index(all_chunks)
+        print(" listo.")
 
     print(f"\nIndexación completa.")
-    print(f"  Fragmentos añadidos/actualizados: {total_chunks}")
-    print(f"  Total en base de conocimiento:    {collection.count()}")
+    print(f"  Fragmentos nuevos:              {total_new}")
+    print(f"  Total en base de conocimiento:  {len(all_chunks)}")
 
 
 def list_documents():
     """Lista los documentos actualmente indexados."""
-    collection = get_collection(create=False)
-    if collection is None or collection.count() == 0:
+    chunks = load_chunks()
+    if not chunks:
         print("La base de conocimiento está vacía.")
         return
 
-    results = collection.get(include=["metadatas"])
-    sources = {}
-    for meta in results["metadatas"]:
-        src = meta["source"]
-        sources[src] = sources.get(src, 0) + 1
+    sources: dict[str, int] = {}
+    for c in chunks:
+        sources[c["source"]] = sources.get(c["source"], 0) + 1
 
-    print(f"Documentos indexados ({collection.count()} fragmentos totales):")
-    for source, count in sorted(sources.items()):
-        print(f"  - {source}: {count} fragmentos")
+    print(f"Documentos indexados ({len(chunks)} fragmentos totales):")
+    for src, count in sorted(sources.items()):
+        print(f"  - {src}: {count} fragmentos")
 
 
 def clear_collection():
     """Elimina todos los documentos indexados."""
-    collection = get_collection(create=False)
-    if collection is None or collection.count() == 0:
-        print("La base de conocimiento ya está vacía.")
-        return
-
-    count = collection.count()
-    VECTOR_DB_DIR.mkdir(exist_ok=True)
-    client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-    client.delete_collection(name=COLLECTION_NAME)
-    print(f"Base de conocimiento limpiada ({count} fragmentos eliminados).")
+    removed = 0
+    for path in [CHUNKS_FILE, INDEX_FILE]:
+        if path.exists():
+            path.unlink()
+            removed += 1
+    if removed:
+        print("Base de conocimiento limpiada.")
+    else:
+        print("La base de conocimiento ya estaba vacía.")
 
 
 if __name__ == "__main__":
