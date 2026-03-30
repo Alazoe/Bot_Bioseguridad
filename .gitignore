@@ -1,0 +1,17 @@
+# Variables de entorno (nunca commitear)
+.env
+
+# Base de datos vectorial (generada localmente)
+vector_db/*
+!vector_db/.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Modelos descargados por sentence-transformers
+.cache/

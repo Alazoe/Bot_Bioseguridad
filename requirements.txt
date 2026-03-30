@@ -1,0 +1,6 @@
+python-telegram-bot>=20.7
+anthropic>=0.25.0
+chromadb>=0.5.0
+pypdf>=4.0.0
+python-dotenv>=1.0.0
+sentence-transformers>=2.7.0

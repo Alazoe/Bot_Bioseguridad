@@ -1,0 +1,4 @@
+# La base de datos vectorial se genera localmente con `python ingest.py`
+# No se incluye en el repositorio
+*
+!.gitignore
