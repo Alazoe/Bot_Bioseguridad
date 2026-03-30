@@ -10,7 +10,7 @@ Uso:
 
 import sys
 from pathlib import Path
-from pypdf import PdfReader
+import fitz  # PyMuPDF
 import chromadb
 from chromadb.utils import embedding_functions
 
@@ -60,12 +60,13 @@ def chunk_text(text: str) -> list[str]:
 
 def extract_text_from_pdf(filepath: Path) -> str:
     """Extrae texto de un PDF página por página."""
-    reader = PdfReader(filepath)
+    doc = fitz.open(filepath)
     pages_text = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text()
+    for i, page in enumerate(doc):
+        text = page.get_text()
         if text and text.strip():
             pages_text.append(f"[Página {i + 1}]\n{text.strip()}")
+    doc.close()
     return "\n\n".join(pages_text)
 
 
